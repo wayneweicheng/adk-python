@@ -1,0 +1,425 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Hybrid cloud-skills agent using imported Python helpers and native tools.
+
+This sample demonstrates a stronger production boundary for cloud-focused
+skills. The original script-backed skills are preserved under
+`original_skills/`, while the runnable agent loads transformed skills from
+`skills/` and exposes only reviewed tool entry points.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import logging
+import os
+from pathlib import Path
+import re
+from typing import Any
+
+from google.adk import Agent
+from google.adk.tools.skill_toolset import SkillToolset
+
+logger = logging.getLogger(__name__)
+
+_AGENT_DIR = Path(__file__).resolve().parent
+_SKILLS_DIR = _AGENT_DIR / 'skills'
+_ORIGINAL_SKILLS_DIR = _AGENT_DIR / 'original_skills'
+_PROJECT_ROOT_ENV = 'ADK_CLOUD_HYBRID_SKILLS_PROJECT_ROOT'
+_MAX_TEXT_BYTES_ENV = 'ADK_CLOUD_HYBRID_SKILLS_MAX_TEXT_BYTES'
+_DEFAULT_PROJECT_ENV = 'CLOUD_HYBRID_DEFAULT_PROJECT'
+_DEFAULT_BUCKET_ENV = 'CLOUD_HYBRID_DEFAULT_BUCKET'
+_DEFAULT_DATASET_ENV = 'CLOUD_HYBRID_DEFAULT_DATASET'
+_BLOCKED_FILE_NAMES = {
+    '.netrc',
+    '.npmrc',
+    '.pgpass',
+    '.pypirc',
+    'application_default_credentials.json',
+    'credentials.json',
+    'id_dsa',
+    'id_ecdsa',
+    'id_ed25519',
+    'id_rsa',
+    'token.json',
+}
+_BLOCKED_NAME_FRAGMENTS = ('credential', 'secret', 'token')
+_BLOCKED_SUFFIXES = {'.pem', '.key', '.p12', '.pfx', '.crt', '.cer', '.der'}
+_TEXT_PREVIEW_TYPES = ('application/json', 'application/x-ndjson', 'text/')
+_TABLE_REF_RE = re.compile(
+    r'^(?:(?P<project>[a-z0-9-]+)\.)?(?P<dataset>[A-Za-z0-9_]+)\.(?P<table>[A-Za-z0-9_]+)$'
+)
+
+
+def _get_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        logger.warning(
+            'Invalid %s value %r. Falling back to %d.',
+            name,
+            raw_value,
+            default,
+        )
+        return default
+
+
+def _find_project_root(start_dir: Path) -> Path:
+    for candidate in (start_dir, *start_dir.parents):
+        if (candidate / '.git').exists() or (candidate / 'pyproject.toml').exists():
+            return candidate
+    return start_dir
+
+
+_PROJECT_ROOT = Path(
+    os.getenv(_PROJECT_ROOT_ENV) or _find_project_root(_AGENT_DIR)
+).expanduser().resolve()
+os.environ.setdefault(_PROJECT_ROOT_ENV, str(_PROJECT_ROOT))
+_MAX_TEXT_BYTES = _get_int_env(_MAX_TEXT_BYTES_ENV, 120_000)
+_DEFAULT_PROJECT = os.getenv(_DEFAULT_PROJECT_ENV, '').strip()
+_DEFAULT_BUCKET = os.getenv(_DEFAULT_BUCKET_ENV, '').strip()
+_DEFAULT_DATASET = os.getenv(_DEFAULT_DATASET_ENV, '').strip()
+
+
+class NativeOnlySkillToolset(SkillToolset):
+    """Skill toolset that hides `run_skill_script` from callers."""
+
+    async def get_tools(self, readonly_context=None):
+        tools = await super().get_tools(readonly_context)
+        return [tool for tool in tools if tool.name != 'run_skill_script']
+
+
+def _load_skill_from_dir(skill_dir: Path):
+    try:
+        from google.adk.skills import load_skill_from_dir
+    except ImportError as exc:
+        raise RuntimeError(
+            'google-adk does not expose load_skill_from_dir. '
+            'Use the repo virtualenv or install the local adk-python checkout.'
+        ) from exc
+    return load_skill_from_dir(skill_dir)
+
+
+def _load_all_skills():
+    if not _SKILLS_DIR.exists():
+        logger.warning('Skills directory does not exist: %s', _SKILLS_DIR)
+        return []
+
+    skills = []
+    for skill_dir in sorted(_SKILLS_DIR.iterdir()):
+        if skill_dir.is_dir() and (skill_dir / 'SKILL.md').exists():
+            try:
+                skills.append(_load_skill_from_dir(skill_dir))
+            except Exception:
+                logger.exception('Skipping invalid skill directory: %s', skill_dir)
+    return skills
+
+
+def _ensure_safe_local_path(path: Path) -> None:
+    name = path.name.lower()
+    if name == '.env' or (name.startswith('.env.') and name != '.env.example'):
+        raise PermissionError(f'access to {path.name!r} is blocked')
+    if name in _BLOCKED_FILE_NAMES:
+        raise PermissionError(f'access to {path.name!r} is blocked')
+    if any(fragment in name for fragment in _BLOCKED_NAME_FRAGMENTS):
+        raise PermissionError(f'access to {path.name!r} is blocked')
+    if path.suffix.lower() in _BLOCKED_SUFFIXES:
+        raise PermissionError(f'access to {path.name!r} is blocked')
+
+
+def _resolve_local_path(path: str) -> Path:
+    if not isinstance(path, str):
+        raise TypeError(f'path must be a string, got {type(path).__name__}')
+    candidate = Path(path).expanduser()
+    resolved = candidate.resolve() if candidate.is_absolute() else (_PROJECT_ROOT / candidate).resolve()
+    try:
+        resolved.relative_to(_PROJECT_ROOT)
+    except ValueError as exc:
+        raise ValueError(
+            f'path {resolved!r} is outside project root {_PROJECT_ROOT!s}'
+        ) from exc
+    _ensure_safe_local_path(resolved)
+    return resolved
+
+
+def _load_helper_module(relative_path: str, module_name: str):
+    helper_path = _ORIGINAL_SKILLS_DIR / relative_path
+    spec = importlib.util.spec_from_file_location(module_name, helper_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'Unable to load helper module from {helper_path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_gcs_inventory = _load_helper_module(
+    'gcs-investigator/scripts/gcs_inventory.py',
+    'cloud_hybrid_gcs_inventory',
+)
+_gcs_preview = _load_helper_module(
+    'gcs-investigator/scripts/object_preview.py',
+    'cloud_hybrid_gcs_preview',
+)
+_bq_dataset_tables = _load_helper_module(
+    'bigquery-catalog-review/scripts/list_dataset_tables.py',
+    'cloud_hybrid_bq_list_dataset_tables',
+)
+_bq_table_profile = _load_helper_module(
+    'bigquery-catalog-review/scripts/table_profile.py',
+    'cloud_hybrid_bq_table_profile',
+)
+
+
+def parse_gcs_resource(resource: str) -> dict[str, Any]:
+    """Parse a GCS bucket or gs:// URI into bucket and prefix parts."""
+    if not isinstance(resource, str):
+        return {'error': f'resource must be a string, got {type(resource).__name__}'}
+    resource = resource.strip()
+    if not resource:
+        return {'error': 'resource must not be empty'}
+    if resource.startswith('gs://'):
+        trimmed = resource[5:]
+        bucket, _, prefix = trimmed.partition('/')
+    else:
+        bucket, _, prefix = resource.partition('/')
+    if not bucket:
+        return {'error': 'bucket name could not be determined'}
+    return {
+        'resource': resource,
+        'bucket_name': bucket,
+        'prefix': prefix,
+        'normalized_uri': f'gs://{bucket}/{prefix}' if prefix else f'gs://{bucket}',
+    }
+
+
+def list_gcs_objects(
+    bucket_name: str,
+    prefix: str = '',
+    project_id: str = '',
+    max_results: int = 25,
+) -> dict[str, Any]:
+    """List bounded GCS objects using the imported helper module."""
+    if not isinstance(bucket_name, str) or not bucket_name.strip():
+        return {'error': 'bucket_name must be a non-empty string'}
+    if not isinstance(prefix, str):
+        return {'error': f'prefix must be a string, got {type(prefix).__name__}'}
+    if max_results <= 0:
+        return {'error': 'max_results must be greater than zero'}
+    project = project_id.strip() if isinstance(project_id, str) else ''
+    project = project or _DEFAULT_PROJECT
+    return _gcs_inventory.list_objects(
+        project_id=project,
+        bucket_name=bucket_name.strip(),
+        prefix=prefix.strip(),
+        max_results=max_results,
+    )
+
+
+def preview_gcs_text_object(
+    bucket_name: str,
+    object_name: str,
+    project_id: str = '',
+    max_bytes: int = 4096,
+) -> dict[str, Any]:
+    """Preview a safe text object using the imported helper module."""
+    if not isinstance(bucket_name, str) or not bucket_name.strip():
+        return {'error': 'bucket_name must be a non-empty string'}
+    if not isinstance(object_name, str) or not object_name.strip():
+        return {'error': 'object_name must be a non-empty string'}
+    if max_bytes <= 0 or max_bytes > _MAX_TEXT_BYTES:
+        return {'error': f'max_bytes must be between 1 and {_MAX_TEXT_BYTES}'}
+    project = project_id.strip() if isinstance(project_id, str) else ''
+    project = project or _DEFAULT_PROJECT
+    return _gcs_preview.preview_text_object(
+        project_id=project,
+        bucket_name=bucket_name.strip(),
+        object_name=object_name.strip(),
+        max_bytes=max_bytes,
+    )
+
+
+def parse_bigquery_resource(
+    resource: str,
+    default_project: str = '',
+    default_dataset: str = '',
+) -> dict[str, Any]:
+    """Parse dataset.table or project.dataset.table into structured parts."""
+    if not isinstance(resource, str):
+        return {'error': f'resource must be a string, got {type(resource).__name__}'}
+    resource = resource.strip().replace(':', '.')
+    if not resource:
+        return {'error': 'resource must not be empty'}
+    match = _TABLE_REF_RE.match(resource)
+    if not match:
+        if resource.count('.') == 1:
+            dataset, table = resource.split('.', 1)
+            project = default_project or _DEFAULT_PROJECT
+            if not project:
+                return {'error': 'default project is required for dataset.table references'}
+            return {
+                'project_id': project,
+                'dataset_id': dataset,
+                'table_id': table,
+                'normalized': f'{project}.{dataset}.{table}',
+            }
+        return {'error': 'resource must be dataset.table or project.dataset.table'}
+    project = match.group('project') or default_project or _DEFAULT_PROJECT
+    dataset = match.group('dataset')
+    table = match.group('table')
+    if not project:
+        return {'error': 'project_id could not be determined'}
+    return {
+        'project_id': project,
+        'dataset_id': dataset,
+        'table_id': table,
+        'normalized': f'{project}.{dataset}.{table}',
+    }
+
+
+def list_bigquery_tables(
+    dataset_id: str,
+    project_id: str = '',
+    include_views: bool = True,
+    max_results: int = 50,
+) -> dict[str, Any]:
+    """List tables for a dataset using the imported helper module."""
+    if not isinstance(dataset_id, str) or not dataset_id.strip():
+        return {'error': 'dataset_id must be a non-empty string'}
+    if max_results <= 0:
+        return {'error': 'max_results must be greater than zero'}
+    project = project_id.strip() if isinstance(project_id, str) else ''
+    project = project or _DEFAULT_PROJECT
+    if not project:
+        return {'error': 'project_id is required'}
+    return _bq_dataset_tables.list_dataset_tables(
+        project_id=project,
+        dataset_id=dataset_id.strip(),
+        include_views=include_views,
+        max_results=max_results,
+    )
+
+
+def inspect_bigquery_table(
+    table_id: str,
+    dataset_id: str = '',
+    project_id: str = '',
+    table_ref: str = '',
+) -> dict[str, Any]:
+    """Inspect a BigQuery table using the imported helper module."""
+    if table_ref:
+        parsed = parse_bigquery_resource(
+            table_ref,
+            default_project=project_id,
+            default_dataset=dataset_id,
+        )
+        if 'error' in parsed:
+            return parsed
+        project = parsed['project_id']
+        dataset = parsed['dataset_id']
+        table = parsed['table_id']
+    else:
+        if not isinstance(table_id, str) or not table_id.strip():
+            return {'error': 'table_id must be a non-empty string'}
+        project = project_id.strip() if isinstance(project_id, str) else ''
+        dataset = dataset_id.strip() if isinstance(dataset_id, str) else ''
+        project = project or _DEFAULT_PROJECT
+        dataset = dataset or _DEFAULT_DATASET
+        if not project or not dataset:
+            return {'error': 'project_id and dataset_id are required when table_ref is not provided'}
+        table = table_id.strip()
+    return _bq_table_profile.inspect_table(
+        project_id=project,
+        dataset_id=dataset,
+        table_id=table,
+    )
+
+
+def summarize_pipeline_alignment(
+    object_names: list[str],
+    table_names: list[str],
+    prefix: str = '',
+) -> dict[str, Any]:
+    """Compare object-name patterns with BigQuery table names for triage."""
+    if not isinstance(object_names, list) or not all(isinstance(v, str) for v in object_names):
+        return {'error': 'object_names must be a list of strings'}
+    if not isinstance(table_names, list) or not all(isinstance(v, str) for v in table_names):
+        return {'error': 'table_names must be a list of strings'}
+
+    normalized_tables = {name.lower() for name in table_names}
+    inferred_targets = {}
+    for object_name in object_names:
+        stem = Path(object_name).stem.lower()
+        stem = re.sub(r'[^a-z0-9_]+', '_', stem)
+        candidates = [part for part in stem.split('_') if part]
+        matched = sorted({table for table in normalized_tables if any(part in table for part in candidates)})
+        inferred_targets[object_name] = matched[:5]
+
+    covered_tables = {match for matches in inferred_targets.values() for match in matches}
+    return {
+        'prefix': prefix,
+        'object_count': len(object_names),
+        'table_count': len(table_names),
+        'missing_table_matches': sorted(normalized_tables - covered_tables),
+        'objects_without_matches': [
+            name for name, matches in inferred_targets.items() if not matches
+        ],
+        'inferred_targets': inferred_targets,
+    }
+
+
+def read_local_reference(path: str) -> dict[str, Any]:
+    """Read a local reference file under the configured project root."""
+    try:
+        resolved = _resolve_local_path(path)
+        if not resolved.is_file():
+            return {'error': f'{path!r} is not a file'}
+        content = resolved.read_text(encoding='utf-8')
+        if len(content.encode('utf-8')) > _MAX_TEXT_BYTES:
+            return {'error': f'{path!r} exceeds {_MAX_TEXT_BYTES} bytes'}
+        return {
+            'path': str(resolved.relative_to(_PROJECT_ROOT)),
+            'content': content,
+        }
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {'error': str(exc)}
+
+
+skills = _load_all_skills()
+skill_toolset = NativeOnlySkillToolset(
+    skills=skills,
+    additional_tools=[
+        parse_gcs_resource,
+        list_gcs_objects,
+        preview_gcs_text_object,
+        parse_bigquery_resource,
+        list_bigquery_tables,
+        inspect_bigquery_table,
+        summarize_pipeline_alignment,
+        read_local_reference,
+    ],
+)
+
+root_agent = Agent(
+    model='gemini-2.5-flash',
+    name='claude_code_skills_cloud_hybrid',
+    description=(
+        'An agent that demonstrates complex cloud investigation skills '
+        'using the hybrid pattern without exposing run_skill_script.'
+    ),
+    tools=[skill_toolset],
+)
