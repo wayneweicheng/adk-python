@@ -4,3 +4,14 @@ tools:
   - read_git_diff
   - stage_project_files
   - create_git_commit
+mappings:
+  - from: git status / what has changed
+    to:
+      - git_status_summary
+      - list_changed_files
+  - from: git diff / inspect the diff
+    to: read_git_diff
+  - from: git add / stage files
+    to: stage_project_files
+  - from: Create / make a commit
+    to: create_git_commit

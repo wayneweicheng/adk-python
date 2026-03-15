@@ -3,3 +3,14 @@ tools:
   - backup_project_file
   - replace_text_in_project_file
   - write_project_file
+mappings:
+  - from: scripts/read_file.py
+    to: read_project_file
+  - from: scripts/backup.sh
+    to: backup_project_file
+  - from: Back up a file
+    to: backup_project_file
+  - from: Targeted text replacement
+    to: replace_text_in_project_file
+  - from: Full-file overwrite
+    to: write_project_file

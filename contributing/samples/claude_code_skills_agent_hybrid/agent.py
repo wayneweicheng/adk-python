@@ -102,14 +102,21 @@ class NativeOnlySkillToolset(SkillToolset):
     """Skill toolset that maps tools via `tools/<skill>/tools.yaml` files."""
 
     def __init__(self, *args, tools_dir: Path = _TOOLS_DIR, **kwargs):
-        self._skill_tool_names = self._load_skill_tool_names(tools_dir)
+        self._skill_instruction_mappings = self._load_instruction_mappings(tools_dir)
+        self._skill_tool_configs = self._load_skill_tool_configs(tools_dir)
+        self._skill_tool_names = {
+            skill_name: tuple(config['name'] for config in configs)
+            for skill_name, configs in self._skill_tool_configs.items()
+        }
         super().__init__(*args, **kwargs)
 
     @staticmethod
-    def _load_skill_tool_names(tools_dir: Path) -> dict[str, tuple[str, ...]]:
-        skill_tool_names = {}
+    def _load_instruction_mappings(
+        tools_dir: Path,
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
+        instruction_mappings = {}
         if not tools_dir.is_dir():
-            return skill_tool_names
+            return instruction_mappings
 
         for skill_dir in sorted(tools_dir.iterdir()):
             if not skill_dir.is_dir():
@@ -119,7 +126,63 @@ class NativeOnlySkillToolset(SkillToolset):
             if not tools_file.exists():
                 continue
 
-            ordered_names = []
+            parsed = yaml.safe_load(tools_file.read_text(encoding='utf-8')) or {}
+            if not isinstance(parsed, dict):
+                continue
+
+            raw_mappings = parsed.get('mappings', [])
+            if not isinstance(raw_mappings, list):
+                raw_mappings = []
+
+            ordered_mappings = []
+            for entry in raw_mappings:
+                if not isinstance(entry, dict):
+                    continue
+                raw_from = entry.get('from', '')
+                if not isinstance(raw_from, str):
+                    continue
+                source_name = raw_from.strip()
+                if not source_name:
+                    continue
+
+                raw_to = entry.get('to', [])
+                if isinstance(raw_to, str):
+                    target_names = [raw_to.strip()]
+                elif isinstance(raw_to, list):
+                    target_names = [
+                        value.strip()
+                        for value in raw_to
+                        if isinstance(value, str) and value.strip()
+                    ]
+                else:
+                    target_names = []
+                if target_names:
+                    ordered_mappings.append({
+                        'from': source_name,
+                        'to': tuple(target_names),
+                    })
+
+            instruction_mappings[skill_dir.name] = tuple(ordered_mappings)
+
+        return instruction_mappings
+
+    @staticmethod
+    def _load_skill_tool_configs(
+        tools_dir: Path,
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
+        skill_tool_configs = {}
+        if not tools_dir.is_dir():
+            return skill_tool_configs
+
+        for skill_dir in sorted(tools_dir.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+
+            tools_file = skill_dir / 'tools.yaml'
+            if not tools_file.exists():
+                continue
+
+            ordered_configs = []
             seen_names = set()
             parsed = yaml.safe_load(tools_file.read_text(encoding='utf-8')) or {}
             if not isinstance(parsed, dict):
@@ -137,6 +200,40 @@ class NativeOnlySkillToolset(SkillToolset):
                 )
                 continue
 
+            mappings_by_name = {}
+            raw_mappings = parsed.get('mappings', [])
+            if not isinstance(raw_mappings, list):
+                logger.warning(
+                    'Ignoring invalid tool mappings in %s: "mappings" must be a list.',
+                    tools_file,
+                )
+                raw_mappings = []
+
+            for entry in raw_mappings:
+                if not isinstance(entry, dict):
+                    continue
+                raw_from = entry.get('from', '')
+                if not isinstance(raw_from, str):
+                    continue
+                source_name = raw_from.strip()
+                if not source_name:
+                    continue
+
+                raw_to = entry.get('to', [])
+                if isinstance(raw_to, str):
+                    target_names = [raw_to.strip()]
+                elif isinstance(raw_to, list):
+                    target_names = [
+                        value.strip()
+                        for value in raw_to
+                        if isinstance(value, str) and value.strip()
+                    ]
+                else:
+                    target_names = []
+
+                for target_name in target_names:
+                    mappings_by_name.setdefault(target_name, []).append(source_name)
+
             for entry in raw_tools:
                 if isinstance(entry, str):
                     tool_name = entry.strip()
@@ -146,15 +243,17 @@ class NativeOnlySkillToolset(SkillToolset):
                 else:
                     tool_name = ''
 
-                if not tool_name:
+                if not tool_name or tool_name in seen_names:
                     continue
-                if tool_name not in seen_names:
-                    ordered_names.append(tool_name)
-                    seen_names.add(tool_name)
+                ordered_configs.append({
+                    'name': tool_name,
+                    'maps_from': tuple(mappings_by_name.get(tool_name, ())),
+                })
+                seen_names.add(tool_name)
 
-            skill_tool_names[skill_dir.name] = tuple(ordered_names)
+            skill_tool_configs[skill_dir.name] = tuple(ordered_configs)
 
-        return skill_tool_names
+        return skill_tool_configs
 
     async def get_tools(self, readonly_context=None):
         tools = await super().get_tools(readonly_context)
@@ -210,6 +309,25 @@ class NativeOnlySkillToolset(SkillToolset):
             existing_tool_names.add(tool.name)
 
         return resolved_tools
+
+
+def _format_mapping_lines(
+    skill_toolset: NativeOnlySkillToolset,
+    *,
+    arrow: str,
+    width: int,
+) -> str:
+    lines = []
+    seen_sources = set()
+    for mappings in skill_toolset._skill_instruction_mappings.values():
+        for mapping in mappings:
+            source_name = mapping['from']
+            if source_name in seen_sources:
+                continue
+            target_label = ', '.join(mapping['to'])
+            lines.append(f'  {source_name:<{width}} {arrow} {target_label}')
+            seen_sources.add(source_name)
+    return '\n'.join(lines)
 
 
 def _load_skill_from_dir(skill_dir: Path):
@@ -559,21 +677,16 @@ This agent uses native Python tools instead of shell scripts or a code executor.
 When a skill's instructions reference scripts, raw git commands, or generic file
 operations, translate them to the equivalent native tool:
 
-  scripts/lint_check.sh              → lint_project_file
-  scripts/count_complexity.py        → count_python_complexity
-  scripts/read_file.py               → read_project_file
-  scripts/backup.sh                  → backup_project_file
-  Read / inspect a file              → read_project_file
-  Back up a file                     → backup_project_file
-  Targeted text replacement          → replace_text_in_project_file
-  Full-file overwrite                → write_project_file
-  git status / what has changed      → git_status_summary, list_changed_files
-  git diff / inspect the diff        → read_git_diff
-  git add / stage files              → stage_project_files
-  Create / make a commit             → create_git_commit
+{mapping_lines}
 
 `run_skill_script` is not available. Always use the equivalent native tool above.
-"""
+""".format(
+    mapping_lines=_format_mapping_lines(
+        skill_toolset,
+        arrow='→',
+        width=34,
+    )
+)
 
 root_agent = Agent(
     model='gemini-2.5-flash',

@@ -1,0 +1,11 @@
+tools:
+  - parse_bigquery_resource
+  - list_bigquery_tables
+  - inspect_bigquery_table
+mappings:
+  - from: scripts/parse_table_ref.sh
+    to: parse_bigquery_resource
+  - from: scripts/list_dataset_tables.py
+    to: list_bigquery_tables
+  - from: scripts/table_profile.py
+    to: inspect_bigquery_table

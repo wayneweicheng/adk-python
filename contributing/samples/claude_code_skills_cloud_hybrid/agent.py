@@ -14,14 +14,20 @@
 
 """Hybrid cloud-skills agent using imported Python helpers and native tools.
 
-This sample demonstrates a stronger production boundary for cloud-focused
-skills. The original script-backed skills are preserved under
-`original_skills/`, while the runnable agent loads transformed skills from
-`skills/` and exposes only reviewed tool entry points.
+This sample keeps the original skill text and bundled scripts intact, but maps
+skill activation to reviewed native tools instead of exposing a code executor.
+Python helper scripts are imported directly as modules, while simple bash
+behavior is rewritten as thin Python tools.
+
+Runtime configuration:
+  - `ADK_CLOUD_HYBRID_SKILLS_MAX_TEXT_BYTES` caps bounded object previews.
+  - `CLOUD_HYBRID_DEFAULT_PROJECT` sets the default GCP project.
+  - `CLOUD_HYBRID_DEFAULT_DATASET` sets the default BigQuery dataset.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import os
@@ -29,37 +35,23 @@ from pathlib import Path
 import re
 from typing import Any
 
+import yaml
+
 from google.adk import Agent
+from google.adk.planners import PlanReActPlanner
 from google.adk.tools.skill_toolset import SkillToolset
 
 logger = logging.getLogger(__name__)
 
 _AGENT_DIR = Path(__file__).resolve().parent
 _SKILLS_DIR = _AGENT_DIR / 'skills'
-_ORIGINAL_SKILLS_DIR = _AGENT_DIR / 'original_skills'
-_PROJECT_ROOT_ENV = 'ADK_CLOUD_HYBRID_SKILLS_PROJECT_ROOT'
+_TOOLS_DIR = _AGENT_DIR / 'tools'
 _MAX_TEXT_BYTES_ENV = 'ADK_CLOUD_HYBRID_SKILLS_MAX_TEXT_BYTES'
 _DEFAULT_PROJECT_ENV = 'CLOUD_HYBRID_DEFAULT_PROJECT'
-_DEFAULT_BUCKET_ENV = 'CLOUD_HYBRID_DEFAULT_BUCKET'
 _DEFAULT_DATASET_ENV = 'CLOUD_HYBRID_DEFAULT_DATASET'
-_BLOCKED_FILE_NAMES = {
-    '.netrc',
-    '.npmrc',
-    '.pgpass',
-    '.pypirc',
-    'application_default_credentials.json',
-    'credentials.json',
-    'id_dsa',
-    'id_ecdsa',
-    'id_ed25519',
-    'id_rsa',
-    'token.json',
-}
-_BLOCKED_NAME_FRAGMENTS = ('credential', 'secret', 'token')
-_BLOCKED_SUFFIXES = {'.pem', '.key', '.p12', '.pfx', '.crt', '.cer', '.der'}
-_TEXT_PREVIEW_TYPES = ('application/json', 'application/x-ndjson', 'text/')
 _TABLE_REF_RE = re.compile(
-    r'^(?:(?P<project>[a-z0-9-]+)\.)?(?P<dataset>[A-Za-z0-9_]+)\.(?P<table>[A-Za-z0-9_]+)$'
+    r'^(?:(?P<project>[a-z0-9-]+)\.)?'
+    r'(?P<dataset>[A-Za-z0-9_]+)\.(?P<table>[A-Za-z0-9_]+)$'
 )
 
 
@@ -79,29 +71,241 @@ def _get_int_env(name: str, default: int) -> int:
         return default
 
 
-def _find_project_root(start_dir: Path) -> Path:
-    for candidate in (start_dir, *start_dir.parents):
-        if (candidate / '.git').exists() or (candidate / 'pyproject.toml').exists():
-            return candidate
-    return start_dir
-
-
-_PROJECT_ROOT = Path(
-    os.getenv(_PROJECT_ROOT_ENV) or _find_project_root(_AGENT_DIR)
-).expanduser().resolve()
-os.environ.setdefault(_PROJECT_ROOT_ENV, str(_PROJECT_ROOT))
 _MAX_TEXT_BYTES = _get_int_env(_MAX_TEXT_BYTES_ENV, 120_000)
 _DEFAULT_PROJECT = os.getenv(_DEFAULT_PROJECT_ENV, '').strip()
-_DEFAULT_BUCKET = os.getenv(_DEFAULT_BUCKET_ENV, '').strip()
 _DEFAULT_DATASET = os.getenv(_DEFAULT_DATASET_ENV, '').strip()
 
 
 class NativeOnlySkillToolset(SkillToolset):
-    """Skill toolset that hides `run_skill_script` from callers."""
+    """Skill toolset that maps tools via `tools/<skill>/tools.yaml` files."""
+
+    def __init__(self, *args, tools_dir: Path = _TOOLS_DIR, **kwargs):
+        self._skill_instruction_mappings = self._load_instruction_mappings(tools_dir)
+        self._skill_tool_configs = self._load_skill_tool_configs(tools_dir)
+        self._skill_tool_names = {
+            skill_name: tuple(config['name'] for config in configs)
+            for skill_name, configs in self._skill_tool_configs.items()
+        }
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _load_instruction_mappings(
+        tools_dir: Path,
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
+        instruction_mappings = {}
+        if not tools_dir.is_dir():
+            return instruction_mappings
+
+        for skill_dir in sorted(tools_dir.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+
+            tools_file = skill_dir / 'tools.yaml'
+            if not tools_file.exists():
+                continue
+
+            parsed = yaml.safe_load(tools_file.read_text(encoding='utf-8')) or {}
+            if not isinstance(parsed, dict):
+                continue
+
+            raw_mappings = parsed.get('mappings', [])
+            if not isinstance(raw_mappings, list):
+                raw_mappings = []
+
+            ordered_mappings = []
+            for entry in raw_mappings:
+                if not isinstance(entry, dict):
+                    continue
+                raw_from = entry.get('from', '')
+                if not isinstance(raw_from, str):
+                    continue
+                source_name = raw_from.strip()
+                if not source_name:
+                    continue
+
+                raw_to = entry.get('to', [])
+                if isinstance(raw_to, str):
+                    target_names = [raw_to.strip()]
+                elif isinstance(raw_to, list):
+                    target_names = [
+                        value.strip()
+                        for value in raw_to
+                        if isinstance(value, str) and value.strip()
+                    ]
+                else:
+                    target_names = []
+                if target_names:
+                    ordered_mappings.append({
+                        'from': source_name,
+                        'to': tuple(target_names),
+                    })
+
+            instruction_mappings[skill_dir.name] = tuple(ordered_mappings)
+
+        return instruction_mappings
+
+    @staticmethod
+    def _load_skill_tool_configs(
+        tools_dir: Path,
+    ) -> dict[str, tuple[dict[str, Any], ...]]:
+        skill_tool_configs = {}
+        if not tools_dir.is_dir():
+            return skill_tool_configs
+
+        for skill_dir in sorted(tools_dir.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+
+            tools_file = skill_dir / 'tools.yaml'
+            if not tools_file.exists():
+                continue
+
+            ordered_configs = []
+            seen_names = set()
+            parsed = yaml.safe_load(tools_file.read_text(encoding='utf-8')) or {}
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    'Ignoring invalid tool mapping in %s: expected a mapping.',
+                    tools_file,
+                )
+                continue
+
+            raw_tools = parsed.get('tools', [])
+            if not isinstance(raw_tools, list):
+                logger.warning(
+                    'Ignoring invalid tool mapping in %s: "tools" must be a list.',
+                    tools_file,
+                )
+                continue
+
+            mappings_by_name = {}
+            raw_mappings = parsed.get('mappings', [])
+            if not isinstance(raw_mappings, list):
+                logger.warning(
+                    'Ignoring invalid tool mappings in %s: "mappings" must be a list.',
+                    tools_file,
+                )
+                raw_mappings = []
+
+            for entry in raw_mappings:
+                if not isinstance(entry, dict):
+                    continue
+                raw_from = entry.get('from', '')
+                if not isinstance(raw_from, str):
+                    continue
+                source_name = raw_from.strip()
+                if not source_name:
+                    continue
+
+                raw_to = entry.get('to', [])
+                if isinstance(raw_to, str):
+                    target_names = [raw_to.strip()]
+                elif isinstance(raw_to, list):
+                    target_names = [
+                        value.strip()
+                        for value in raw_to
+                        if isinstance(value, str) and value.strip()
+                    ]
+                else:
+                    target_names = []
+
+                for target_name in target_names:
+                    mappings_by_name.setdefault(target_name, []).append(source_name)
+
+            for entry in raw_tools:
+                if isinstance(entry, str):
+                    tool_name = entry.strip()
+                elif isinstance(entry, dict):
+                    raw_name = entry.get('name', '')
+                    tool_name = raw_name.strip() if isinstance(raw_name, str) else ''
+                else:
+                    tool_name = ''
+
+                if not tool_name or tool_name in seen_names:
+                    continue
+                ordered_configs.append({
+                    'name': tool_name,
+                    'maps_from': tuple(mappings_by_name.get(tool_name, ())),
+                })
+                seen_names.add(tool_name)
+
+            skill_tool_configs[skill_dir.name] = tuple(ordered_configs)
+
+        return skill_tool_configs
 
     async def get_tools(self, readonly_context=None):
         tools = await super().get_tools(readonly_context)
         return [tool for tool in tools if tool.name != 'run_skill_script']
+
+    async def _resolve_additional_tools_from_state(self, readonly_context):
+        if not readonly_context:
+            return []
+
+        state_key = f'_adk_activated_skill_{readonly_context.agent_name}'
+        activated_skills = readonly_context.state.get(state_key, [])
+        if not activated_skills:
+            return []
+
+        ordered_tool_names = []
+        seen_tool_names = set()
+        for skill_name in activated_skills:
+            for tool_name in self._skill_tool_names.get(skill_name, ()):
+                if tool_name not in seen_tool_names:
+                    ordered_tool_names.append(tool_name)
+                    seen_tool_names.add(tool_name)
+
+        if not ordered_tool_names:
+            return []
+
+        candidate_tools = self._provided_tools_by_name.copy()
+        if self._provided_toolsets:
+            toolset_results = await asyncio.gather(*(
+                toolset.get_tools_with_prefix(readonly_context)
+                for toolset in self._provided_toolsets
+            ))
+            for toolset_tools in toolset_results:
+                for tool in toolset_tools:
+                    candidate_tools[tool.name] = tool
+
+        resolved_tools = []
+        existing_tool_names = {tool.name for tool in self._tools}
+        for tool_name in ordered_tool_names:
+            tool = candidate_tools.get(tool_name)
+            if tool is None:
+                logger.warning(
+                    'Skill tool mapping referenced unknown tool %r.',
+                    tool_name,
+                )
+                continue
+            if tool.name in existing_tool_names:
+                logger.error(
+                    "Tool name collision: tool '%s' already exists.",
+                    tool.name,
+                )
+                continue
+            resolved_tools.append(tool)
+            existing_tool_names.add(tool.name)
+
+        return resolved_tools
+
+
+def _format_mapping_lines(
+    skill_toolset: NativeOnlySkillToolset,
+    *,
+    arrow: str,
+    width: int,
+) -> str:
+    lines = []
+    seen_sources = set()
+    for mappings in skill_toolset._skill_instruction_mappings.values():
+        for mapping in mappings:
+            source_name = mapping['from']
+            if source_name in seen_sources:
+                continue
+            target_label = ', '.join(mapping['to'])
+            lines.append(f'  {source_name:<{width}} {arrow} {target_label}')
+            seen_sources.add(source_name)
+    return '\n'.join(lines)
 
 
 def _load_skill_from_dir(skill_dir: Path):
@@ -127,38 +331,13 @@ def _load_all_skills():
                 skills.append(_load_skill_from_dir(skill_dir))
             except Exception:
                 logger.exception('Skipping invalid skill directory: %s', skill_dir)
+    if not skills:
+        logger.warning('No skills were loaded from %s', _SKILLS_DIR)
     return skills
 
 
-def _ensure_safe_local_path(path: Path) -> None:
-    name = path.name.lower()
-    if name == '.env' or (name.startswith('.env.') and name != '.env.example'):
-        raise PermissionError(f'access to {path.name!r} is blocked')
-    if name in _BLOCKED_FILE_NAMES:
-        raise PermissionError(f'access to {path.name!r} is blocked')
-    if any(fragment in name for fragment in _BLOCKED_NAME_FRAGMENTS):
-        raise PermissionError(f'access to {path.name!r} is blocked')
-    if path.suffix.lower() in _BLOCKED_SUFFIXES:
-        raise PermissionError(f'access to {path.name!r} is blocked')
-
-
-def _resolve_local_path(path: str) -> Path:
-    if not isinstance(path, str):
-        raise TypeError(f'path must be a string, got {type(path).__name__}')
-    candidate = Path(path).expanduser()
-    resolved = candidate.resolve() if candidate.is_absolute() else (_PROJECT_ROOT / candidate).resolve()
-    try:
-        resolved.relative_to(_PROJECT_ROOT)
-    except ValueError as exc:
-        raise ValueError(
-            f'path {resolved!r} is outside project root {_PROJECT_ROOT!s}'
-        ) from exc
-    _ensure_safe_local_path(resolved)
-    return resolved
-
-
 def _load_helper_module(relative_path: str, module_name: str):
-    helper_path = _ORIGINAL_SKILLS_DIR / relative_path
+    helper_path = _SKILLS_DIR / relative_path
     spec = importlib.util.spec_from_file_location(module_name, helper_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f'Unable to load helper module from {helper_path}')
@@ -186,7 +365,7 @@ _bq_table_profile = _load_helper_module(
 
 
 def parse_gcs_resource(resource: str) -> dict[str, Any]:
-    """Parse a GCS bucket or gs:// URI into bucket and prefix parts."""
+    """Parse a GCS bucket or `gs://` URI into bucket and prefix parts."""
     if not isinstance(resource, str):
         return {'error': f'resource must be a string, got {type(resource).__name__}'}
     resource = resource.strip()
@@ -194,16 +373,20 @@ def parse_gcs_resource(resource: str) -> dict[str, Any]:
         return {'error': 'resource must not be empty'}
     if resource.startswith('gs://'):
         trimmed = resource[5:]
-        bucket, _, prefix = trimmed.partition('/')
+        bucket_name, _, prefix = trimmed.partition('/')
     else:
-        bucket, _, prefix = resource.partition('/')
-    if not bucket:
+        bucket_name, _, prefix = resource.partition('/')
+    if not bucket_name:
         return {'error': 'bucket name could not be determined'}
     return {
         'resource': resource,
-        'bucket_name': bucket,
+        'bucket_name': bucket_name,
         'prefix': prefix,
-        'normalized_uri': f'gs://{bucket}/{prefix}' if prefix else f'gs://{bucket}',
+        'normalized_uri': (
+            f'gs://{bucket_name}/{prefix}'
+            if prefix
+            else f'gs://{bucket_name}'
+        ),
     }
 
 
@@ -236,7 +419,7 @@ def preview_gcs_text_object(
     project_id: str = '',
     max_bytes: int = 4096,
 ) -> dict[str, Any]:
-    """Preview a safe text object using the imported helper module."""
+    """Preview a bounded text object using the imported helper module."""
     if not isinstance(bucket_name, str) or not bucket_name.strip():
         return {'error': 'bucket_name must be a non-empty string'}
     if not isinstance(object_name, str) or not object_name.strip():
@@ -267,27 +450,31 @@ def parse_bigquery_resource(
     match = _TABLE_REF_RE.match(resource)
     if not match:
         if resource.count('.') == 1:
-            dataset, table = resource.split('.', 1)
-            project = default_project or _DEFAULT_PROJECT
-            if not project:
-                return {'error': 'default project is required for dataset.table references'}
+            dataset_id, table_id = resource.split('.', 1)
+            project_id = default_project or _DEFAULT_PROJECT
+            if not project_id:
+                return {
+                    'error': (
+                        'default project is required for dataset.table references'
+                    )
+                }
             return {
-                'project_id': project,
-                'dataset_id': dataset,
-                'table_id': table,
-                'normalized': f'{project}.{dataset}.{table}',
+                'project_id': project_id,
+                'dataset_id': dataset_id,
+                'table_id': table_id,
+                'normalized': f'{project_id}.{dataset_id}.{table_id}',
             }
         return {'error': 'resource must be dataset.table or project.dataset.table'}
-    project = match.group('project') or default_project or _DEFAULT_PROJECT
-    dataset = match.group('dataset')
-    table = match.group('table')
-    if not project:
+    project_id = match.group('project') or default_project or _DEFAULT_PROJECT
+    dataset_id = match.group('dataset')
+    table_id = match.group('table')
+    if not project_id:
         return {'error': 'project_id could not be determined'}
     return {
-        'project_id': project,
-        'dataset_id': dataset,
-        'table_id': table,
-        'normalized': f'{project}.{dataset}.{table}',
+        'project_id': project_id,
+        'dataset_id': dataset_id,
+        'table_id': table_id,
+        'normalized': f'{project_id}.{dataset_id}.{table_id}',
     }
 
 
@@ -340,7 +527,12 @@ def inspect_bigquery_table(
         project = project or _DEFAULT_PROJECT
         dataset = dataset or _DEFAULT_DATASET
         if not project or not dataset:
-            return {'error': 'project_id and dataset_id are required when table_ref is not provided'}
+            return {
+                'error': (
+                    'project_id and dataset_id are required when table_ref is '
+                    'not provided'
+                )
+            }
         table = table_id.strip()
     return _bq_table_profile.inspect_table(
         project_id=project,
@@ -354,10 +546,14 @@ def summarize_pipeline_alignment(
     table_names: list[str],
     prefix: str = '',
 ) -> dict[str, Any]:
-    """Compare object-name patterns with BigQuery table names for triage."""
-    if not isinstance(object_names, list) or not all(isinstance(v, str) for v in object_names):
+    """Compare GCS object-name patterns with BigQuery table names."""
+    if not isinstance(object_names, list) or not all(
+        isinstance(value, str) for value in object_names
+    ):
         return {'error': 'object_names must be a list of strings'}
-    if not isinstance(table_names, list) or not all(isinstance(v, str) for v in table_names):
+    if not isinstance(table_names, list) or not all(
+        isinstance(value, str) for value in table_names
+    ):
         return {'error': 'table_names must be a list of strings'}
 
     normalized_tables = {name.lower() for name in table_names}
@@ -366,37 +562,30 @@ def summarize_pipeline_alignment(
         stem = Path(object_name).stem.lower()
         stem = re.sub(r'[^a-z0-9_]+', '_', stem)
         candidates = [part for part in stem.split('_') if part]
-        matched = sorted({table for table in normalized_tables if any(part in table for part in candidates)})
+        matched = sorted({
+            table_name
+            for table_name in normalized_tables
+            if any(part in table_name for part in candidates)
+        })
         inferred_targets[object_name] = matched[:5]
 
-    covered_tables = {match for matches in inferred_targets.values() for match in matches}
+    covered_tables = {
+        match
+        for matches in inferred_targets.values()
+        for match in matches
+    }
     return {
         'prefix': prefix,
         'object_count': len(object_names),
         'table_count': len(table_names),
         'missing_table_matches': sorted(normalized_tables - covered_tables),
         'objects_without_matches': [
-            name for name, matches in inferred_targets.items() if not matches
+            name
+            for name, matches in inferred_targets.items()
+            if not matches
         ],
         'inferred_targets': inferred_targets,
     }
-
-
-def read_local_reference(path: str) -> dict[str, Any]:
-    """Read a local reference file under the configured project root."""
-    try:
-        resolved = _resolve_local_path(path)
-        if not resolved.is_file():
-            return {'error': f'{path!r} is not a file'}
-        content = resolved.read_text(encoding='utf-8')
-        if len(content.encode('utf-8')) > _MAX_TEXT_BYTES:
-            return {'error': f'{path!r} exceeds {_MAX_TEXT_BYTES} bytes'}
-        return {
-            'path': str(resolved.relative_to(_PROJECT_ROOT)),
-            'content': content,
-        }
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        return {'error': str(exc)}
 
 
 skills = _load_all_skills()
@@ -410,16 +599,35 @@ skill_toolset = NativeOnlySkillToolset(
         list_bigquery_tables,
         inspect_bigquery_table,
         summarize_pipeline_alignment,
-        read_local_reference,
     ],
+)
+
+_TOOL_MAPPING_INSTRUCTION = """\
+This agent uses native Python tools instead of shell scripts or a code executor.
+When a skill's instructions reference scripts or comparison work, translate
+them to the equivalent native tool:
+
+{mapping_lines}
+
+When `data-pipeline-triage` tells you to inspect GCS or BigQuery with subskills,
+call `load_skill` for those subskills first, then use their mapped tools.
+`run_skill_script` is not available.
+""".format(
+    mapping_lines=_format_mapping_lines(
+        skill_toolset,
+        arrow='->',
+        width=34,
+    )
 )
 
 root_agent = Agent(
     model='gemini-2.5-flash',
     name='claude_code_skills_cloud_hybrid',
     description=(
-        'An agent that demonstrates complex cloud investigation skills '
-        'using the hybrid pattern without exposing run_skill_script.'
+        'Agent that preserves original cloud skill text while replacing script '
+        'execution with reviewed native tools.'
     ),
+    instruction=_TOOL_MAPPING_INSTRUCTION,
     tools=[skill_toolset],
+    planner=PlanReActPlanner(),
 )

@@ -5,3 +5,16 @@ tools:
   - git_status_summary
   - list_changed_files
   - read_git_diff
+mappings:
+  - from: scripts/lint_check.sh
+    to: lint_project_file
+  - from: scripts/count_complexity.py
+    to: count_python_complexity
+  - from: Read / inspect a file
+    to: read_project_file
+  - from: git status / what has changed
+    to:
+      - git_status_summary
+      - list_changed_files
+  - from: git diff / inspect the diff
+    to: read_git_diff

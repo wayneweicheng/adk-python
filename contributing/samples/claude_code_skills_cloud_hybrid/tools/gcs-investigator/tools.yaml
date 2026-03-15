@@ -1,0 +1,11 @@
+tools:
+  - parse_gcs_resource
+  - list_gcs_objects
+  - preview_gcs_text_object
+mappings:
+  - from: scripts/normalize_gcs_uri.sh
+    to: parse_gcs_resource
+  - from: scripts/gcs_inventory.py
+    to: list_gcs_objects
+  - from: scripts/object_preview.py
+    to: preview_gcs_text_object

@@ -1,0 +1,5 @@
+tools:
+  - summarize_pipeline_alignment
+mappings:
+  - from: Compare GCS objects to BQ tables
+    to: summarize_pipeline_alignment
