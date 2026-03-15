@@ -1,0 +1,6 @@
+tools:
+  - git_status_summary
+  - list_changed_files
+  - read_git_diff
+  - stage_project_files
+  - create_git_commit

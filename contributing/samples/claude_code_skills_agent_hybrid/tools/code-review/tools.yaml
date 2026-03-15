@@ -1,0 +1,7 @@
+tools:
+  - read_project_file
+  - lint_project_file
+  - count_python_complexity
+  - git_status_summary
+  - list_changed_files
+  - read_git_diff

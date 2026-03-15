@@ -1,0 +1,5 @@
+tools:
+  - read_project_file
+  - backup_project_file
+  - replace_text_in_project_file
+  - write_project_file

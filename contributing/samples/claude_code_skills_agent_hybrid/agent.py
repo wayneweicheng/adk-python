@@ -27,6 +27,7 @@ Runtime configuration:
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import os
@@ -34,6 +35,8 @@ from pathlib import Path
 import shutil
 import subprocess
 from typing import Any
+
+import yaml
 
 from google.adk import Agent
 from google.adk.tools.function_tool import FunctionTool
@@ -43,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 _AGENT_DIR = Path(__file__).resolve().parent
 _SKILLS_DIR = _AGENT_DIR / 'skills'
+_TOOLS_DIR = _AGENT_DIR / 'tools'
 _PROJECT_ROOT_ENV = 'ADK_HYBRID_SKILLS_PROJECT_ROOT'
 _MAX_TEXT_BYTES_ENV = 'ADK_HYBRID_SKILLS_MAX_TEXT_BYTES'
 _GIT_TIMEOUT_ENV = 'ADK_HYBRID_SKILLS_GIT_TIMEOUT_SECONDS'
@@ -95,11 +99,117 @@ _GIT_TIMEOUT_SECONDS = _get_int_env(_GIT_TIMEOUT_ENV, 10)
 
 
 class NativeOnlySkillToolset(SkillToolset):
-    """Skill toolset that hides `run_skill_script` from callers."""
+    """Skill toolset that maps tools via `tools/<skill>/tools.yaml` files."""
+
+    def __init__(self, *args, tools_dir: Path = _TOOLS_DIR, **kwargs):
+        self._skill_tool_names = self._load_skill_tool_names(tools_dir)
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def _load_skill_tool_names(tools_dir: Path) -> dict[str, tuple[str, ...]]:
+        skill_tool_names = {}
+        if not tools_dir.is_dir():
+            return skill_tool_names
+
+        for skill_dir in sorted(tools_dir.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+
+            tools_file = skill_dir / 'tools.yaml'
+            if not tools_file.exists():
+                continue
+
+            ordered_names = []
+            seen_names = set()
+            parsed = yaml.safe_load(tools_file.read_text(encoding='utf-8')) or {}
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    'Ignoring invalid tool mapping in %s: expected a mapping.',
+                    tools_file,
+                )
+                continue
+
+            raw_tools = parsed.get('tools', [])
+            if not isinstance(raw_tools, list):
+                logger.warning(
+                    'Ignoring invalid tool mapping in %s: "tools" must be a list.',
+                    tools_file,
+                )
+                continue
+
+            for entry in raw_tools:
+                if isinstance(entry, str):
+                    tool_name = entry.strip()
+                elif isinstance(entry, dict):
+                    raw_name = entry.get('name', '')
+                    tool_name = raw_name.strip() if isinstance(raw_name, str) else ''
+                else:
+                    tool_name = ''
+
+                if not tool_name:
+                    continue
+                if tool_name not in seen_names:
+                    ordered_names.append(tool_name)
+                    seen_names.add(tool_name)
+
+            skill_tool_names[skill_dir.name] = tuple(ordered_names)
+
+        return skill_tool_names
 
     async def get_tools(self, readonly_context=None):
         tools = await super().get_tools(readonly_context)
         return [tool for tool in tools if tool.name != 'run_skill_script']
+
+    async def _resolve_additional_tools_from_state(self, readonly_context):
+        if not readonly_context:
+            return []
+
+        state_key = f'_adk_activated_skill_{readonly_context.agent_name}'
+        activated_skills = readonly_context.state.get(state_key, [])
+        if not activated_skills:
+            return []
+
+        ordered_tool_names = []
+        seen_tool_names = set()
+        for skill_name in activated_skills:
+            for tool_name in self._skill_tool_names.get(skill_name, ()):
+                if tool_name not in seen_tool_names:
+                    ordered_tool_names.append(tool_name)
+                    seen_tool_names.add(tool_name)
+
+        if not ordered_tool_names:
+            return []
+
+        candidate_tools = self._provided_tools_by_name.copy()
+        if self._provided_toolsets:
+            toolset_results = await asyncio.gather(*(
+                toolset.get_tools_with_prefix(readonly_context)
+                for toolset in self._provided_toolsets
+            ))
+            for toolset_tools in toolset_results:
+                for tool in toolset_tools:
+                    candidate_tools[tool.name] = tool
+
+        resolved_tools = []
+        existing_tool_names = {tool.name for tool in self._tools}
+        for tool_name in ordered_tool_names:
+            tool = candidate_tools.get(tool_name)
+            if tool is None:
+                logger.warning(
+                    'Skill tool mapping referenced unknown tool %r.',
+                    tool_name,
+                )
+                continue
+            if tool.name in existing_tool_names:
+                logger.error(
+                    "Tool name collision: tool '%s' already exists.",
+                    tool.name,
+                )
+                continue
+            resolved_tools.append(tool)
+            existing_tool_names.add(tool.name)
+
+        return resolved_tools
 
 
 def _load_skill_from_dir(skill_dir: Path):
@@ -444,6 +554,27 @@ skill_toolset = NativeOnlySkillToolset(
     ],
 )
 
+_TOOL_MAPPING_INSTRUCTION = """\
+This agent uses native Python tools instead of shell scripts or a code executor.
+When a skill's instructions reference scripts, raw git commands, or generic file
+operations, translate them to the equivalent native tool:
+
+  scripts/lint_check.sh              → lint_project_file
+  scripts/count_complexity.py        → count_python_complexity
+  scripts/read_file.py               → read_project_file
+  scripts/backup.sh                  → backup_project_file
+  Read / inspect a file              → read_project_file
+  Back up a file                     → backup_project_file
+  Targeted text replacement          → replace_text_in_project_file
+  Full-file overwrite                → write_project_file
+  git status / what has changed      → git_status_summary, list_changed_files
+  git diff / inspect the diff        → read_git_diff
+  git add / stage files              → stage_project_files
+  Create / make a commit             → create_git_commit
+
+`run_skill_script` is not available. Always use the equivalent native tool above.
+"""
+
 root_agent = Agent(
     model='gemini-2.5-flash',
     name='claude_code_skills_agent_hybrid',
@@ -451,5 +582,6 @@ root_agent = Agent(
         'Agent that wraps existing Python skill helpers as native modules and '
         'replaces bash behavior with thin Python tools, without a code executor.'
     ),
+    instruction=_TOOL_MAPPING_INSTRUCTION,
     tools=[skill_toolset],
 )
